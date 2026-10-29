@@ -22,6 +22,61 @@
   function setToken(t) { try { t ? localStorage.setItem("zk_token", t) : localStorage.removeItem("zk_token"); } catch (e) {} }
   var me = null;
 
+  // ------------------------------------------------------------ offline cache (service worker)
+  // The SW keeps per-user caches (zk-api-u<id>-v<N>, zk-img-u<id>-v<N>). It never sees the token: we only tell it the user id.
+  var hasSW = false;
+  try { hasSW = "serviceWorker" in navigator && !!navigator.serviceWorker && window.isSecureContext !== false; } catch (e) {}
+  function swPost(msg) {
+    if (!hasSW) return;
+    try {
+      var c = navigator.serviceWorker.controller;
+      if (c) c.postMessage(msg);
+      navigator.serviceWorker.ready.then(function (r) { if (r.active && r.active !== c) r.active.postMessage(msg); }).catch(function () {});
+    } catch (e) {}
+  }
+  // Wipe every user's cached API data and images (logout, 401, token change). Also done from the page, in case no SW runs.
+  function clearOfflineCache() {
+    try { localStorage.removeItem("zk_uid"); } catch (e) {}
+    swPost({ type: "zk-clear" });
+    try {
+      // No controlling SW (e.g. it is still installing): delete from the page. Otherwise the SW does it, in order.
+      if (window.caches && !(hasSW && navigator.serviceWorker.controller)) caches.keys().then(function (ns) {
+        ns.forEach(function (n) { if (/^zk-(api|img)-u\d+-v\d+$/.test(n)) caches.delete(n); });
+      }).catch(function () {});
+    } catch (e) {}
+  }
+  // Tell the SW who is logged in; it deletes every other user's caches.
+  function setOfflineUser(u) {
+    if (!u || !u.id) return;
+    try { localStorage.setItem("zk_uid", String(u.id)); } catch (e) {}
+    swPost({ type: "zk-user", uid: u.id });
+  }
+  function storedUid() { try { return localStorage.getItem("zk_uid"); } catch (e) { return null; } }
+  function signOut() { setToken(null); me = null; clearOfflineCache(); }
+
+  // ------------------------------------------------------------ online / offline state
+  var offline = false, banner = null, updateReady = false;
+  function isOffline() { return offline || navigator.onLine === false; }
+  function setOffline(v) {
+    offline = !!v;
+    var on = isOffline();
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.className = "offline-banner"; banner.setAttribute("role", "status"); banner.hidden = true;
+      banner.textContent = "אין חיבור לאינטרנט · מוצג מהשמירה האחרונה";
+      document.body.appendChild(banner);
+    }
+    banner.hidden = !on;
+    document.body.classList.toggle("is-offline", on);
+    document.querySelectorAll("form[data-needs-net]").forEach(function (f) {
+      var b = f.querySelector("button[type=submit]"), note = f.querySelector(".offline-note");
+      if (b && !f.getAttribute("data-busy")) b.disabled = on;
+      if (note) note.hidden = !on;
+    });
+  }
+  window.addEventListener("online", function () { setOffline(false); });
+  window.addEventListener("offline", function () { setOffline(true); });
+
   // ------------------------------------------------------------ API
   function api(method, path, body) {
     var opts = { method: method, headers: {}, credentials: "omit", mode: "cors" };
@@ -30,7 +85,10 @@
     if (body instanceof FormData) opts.body = body;
     else if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
     return fetch(API + path, opts).then(function (r) {
+      // X-Zk-Time is set only on copies the service worker stored, so its presence means "served from cache".
+      if (method === "GET") setOffline(!!r.headers.get("X-Zk-Time"));
       return r.json().catch(function () { return {}; }).then(function (data) {
+        if (r.status === 401 && t) clearOfflineCache();     // expired or revoked token: drop the offline copy
         if (r.status === 401 && t && path.indexOf("/auth/") !== 0 && path.indexOf("/invites/") !== 0) {
           setToken(null); me = null; renderNav();
           go("#/login?next=" + encodeURIComponent(location.hash));
@@ -38,7 +96,10 @@
         if (!r.ok) { var err = new Error(data.error || "משהו השתבש. נא לנסות שוב."); err.status = r.status; throw err; }
         return data;
       });
-    }, function () { throw new Error("אין חיבור לשרת. נא לבדוק את האינטרנט ולנסות שוב."); });
+    }, function () {
+      setOffline(true);
+      var err = new Error("אין חיבור לשרת. נא לבדוק את האינטרנט ולנסות שוב."); err.offline = true; throw err;
+    });
   }
   function mediaSrc(rel) { return rel ? API + rel : ""; }
 
@@ -128,12 +189,17 @@
     opts = opts || {};
     var box = msgBox();
     var btn = h("button", { class: "btn big" + (opts.ghost ? " ghost" : ""), type: "submit", text: submitText });
-    var f = h("form", { novalidate: false }, box, children, btn);
+    var note = opts.needsNet ? h("p", { class: "msg offline-note", hidden: !isOffline(), text: "העלאה תתאפשר כשהחיבור יחזור" }) : null;
+    var f = h("form", { novalidate: false, "data-needs-net": opts.needsNet ? "1" : null }, box, children, note, btn);
+    if (opts.needsNet && isOffline()) btn.disabled = true;
     f.addEventListener("submit", function (ev) {
       ev.preventDefault();
+      if (opts.needsNet && isOffline()) { if (note) note.hidden = false; return; }
       btn.disabled = true; var old = btn.textContent; btn.textContent = opts.busy || "רגע...";
+      f.setAttribute("data-busy", "1");
       Promise.resolve().then(function () { return send(f); }).catch(function (e) {
-        showMsg(box, e.message); btn.disabled = false; btn.textContent = old;
+        f.removeAttribute("data-busy");
+        showMsg(box, e.message); btn.disabled = opts.needsNet && isOffline(); btn.textContent = old;
       });
     });
     return f;
@@ -145,11 +211,16 @@
     if (me) {
       add(nav, h("a", { href: "#/", text: "הדפים שלי" }));
       add(nav, h("button", { class: "link", type: "button", text: "יציאה", onclick: function () {
-        api("POST", "/auth/logout").catch(function () {}).then(function () { setToken(null); me = null; renderNav(); go("#/"); });
+        clearOfflineCache();
+        api("POST", "/auth/logout").catch(function () {}).then(function () { signOut(); renderNav(); go("#/"); });
       } }));
     }
   }
-  function signedIn(data) { setToken(data.token); me = data.user; renderNav(); }
+  // A new token (login, register, invite join): wipe any earlier offline copy, then bind the caches to this user.
+  function signedIn(data) {
+    if (data.token !== getToken()) clearOfflineCache();
+    setToken(data.token); me = data.user; setOfflineUser(me); renderNav();
+  }
   function needLogin() {
     if (me) return false;
     go("#/login?next=" + encodeURIComponent(location.hash));
@@ -218,7 +289,7 @@
           if (d.cover_error) alert(d.cover_error);
           go("#/m/" + d.memorial.slug);
         });
-      }, { busy: "שומר..." })));
+      }, { busy: "שומר...", needsNet: true })));
   }
 
   function viewMemorial(slug, params) {
@@ -228,7 +299,7 @@
     api("GET", "/memorials/" + encodeURIComponent(slug) + "?filter=" + encodeURIComponent(flt)).then(function (d) {
       var m = d.memorial, groups = [], cur, retried = false;
       // Signed image URLs expire after ~10 minutes; reload the view once if one fails.
-      function onImgErr() { if (!retried) { retried = true; setTimeout(function () { viewMemorial(slug, params); }, 300); } }
+      function onImgErr() { if (!retried && !isOffline()) { retried = true; setTimeout(function () { viewMemorial(slug, params); }, 300); } }
       d.items.forEach(function (it) {
         if (!cur || cur.year !== it.year) { cur = { year: it.year, items: [] }; groups.push(cur); }
         var meta = h("p", { class: "meta", text: it.author + (it.date ? " · " + it.date : "") });
@@ -269,7 +340,7 @@
         "העלאה", function (f) {
           if (!hasFile(f)) throw new Error("נא לבחור תמונה.");
           return api("POST", "/memorials/" + encodeURIComponent(slug) + "/photos", new FormData(f)).then(function () { go("#/m/" + slug); });
-        }, { busy: "מעלה..." }),
+        }, { busy: "מעלה...", needsNet: true }),
       h("a", { href: "#/m/" + slug, text: "חזרה" })));
   }
 
@@ -281,7 +352,7 @@
         field("שנה או תאריך (לא חובה)", { name: "date", maxlength: 40, placeholder: "למשל קיץ 1982" })],
         "שמירה", function (f) {
           return api("POST", "/memorials/" + encodeURIComponent(slug) + "/stories", formObj(f)).then(function () { go("#/m/" + slug); });
-        }),
+        }, { needsNet: true }),
       h("a", { href: "#/m/" + slug, text: "חזרה" })));
   }
 
@@ -313,7 +384,7 @@
         h("section", { class: "card" }, h("h1", { text: "עריכת הדף" }),
           form(memorialFields(m), "שמירה", function (f) {
             return api("POST", "/memorials/" + s + "/edit", new FormData(f)).then(function () { go("#/m/" + slug); });
-          }, { busy: "שומר..." })),
+          }, { busy: "שומר...", needsNet: true })),
         h("section", { class: "card" }, h("h2", { text: "הזמנת משפחה וחברים" }),
           h("p", { text: "שלחו את הקישור הזה (למשל בוואטסאפ). מי שיפתח אותו יוכל להצטרף בצעד אחד." }),
           linkInput, h("p", null, copyBtn, " ", shareBtn), resetBtn,
@@ -351,8 +422,17 @@
     }).catch(errorView);
   }
 
+  // Offline and nothing cached for this screen (e.g. the very first launch without internet).
+  function offlineView() {
+    show(h("section", { class: "card center" }, candle(),
+      h("h1", { text: "אין כרגע חיבור לאינטרנט" }),
+      h("p", { text: "המסך הזה עוד לא נשמר במכשיר. כשהחיבור יחזור, הכול יופיע כאן." }),
+      h("button", { class: "btn big", type: "button", text: "נסו שוב", onclick: function () { start(); } })));
+  }
+
   function errorView(e) {
     if (e && e.status === 401) return;
+    if (e && e.offline) return offlineView();
     show(h("section", { class: "card center" }, candle(),
       h("h1", { text: e && e.status === 404 ? "הדף לא נמצא" : "משהו השתבש" }),
       h("p", { text: (e && e.message) || "נא לנסות שוב." }),
@@ -361,6 +441,7 @@
 
   // ------------------------------------------------------------ router
   function route() {
+    if (updateReady) { location.reload(); return; }   // a new version was installed: pick it up on the next navigation
     var hash = location.hash.replace(/^#/, "") || "/";
     var qi = hash.indexOf("?");
     var path = qi >= 0 ? hash.slice(0, qi) : hash;
@@ -384,10 +465,33 @@
       var p = location.pathname.replace(/^.*?(\/(join|m)\/.*)$/, "$1");
       if (p !== location.pathname || /^\/(join|m)\//.test(p)) { location.replace(location.origin + "/#" + p); return; }
     }
-    window.addEventListener("hashchange", route);
-    if (!getToken()) { renderNav(); return route(); }
-    api("GET", "/auth/me").then(function (d) { me = d.user; }, function () { setToken(null); me = null; })
-      .then(function () { renderNav(); route(); });
+    if (!started) { started = true; window.addEventListener("hashchange", route); registerSW(); }
+    setOffline(false);
+    if (!getToken()) {
+      if (storedUid()) clearOfflineCache();
+      renderNav(); return route();
+    }
+    api("GET", "/auth/me").then(function (d) {
+      me = d.user;
+      if (storedUid() !== String(me.id)) clearOfflineCache();   // token now belongs to someone else
+      setOfflineUser(me);
+      renderNav(); route();
+    }, function (e) {
+      if (e && e.offline) { me = null; renderNav(); return offlineView(); }  // keep the token: we are only offline
+      signOut(); renderNav(); route();
+    });
   }
+
+  function registerSW() {
+    if (!hasSW) return;
+    try {
+      var url = "/sw.js";
+      if (isLocal && API !== String(window.API_BASE || "").replace(/\/+$/, "")) url += "?api=" + encodeURIComponent(API);
+      var hadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.addEventListener("controllerchange", function () { if (hadController) updateReady = true; hadController = true; });
+      navigator.serviceWorker.register(url, { scope: "/" }).catch(function () {});
+    } catch (e) {}
+  }
+  var started = false;
   start();
 })();

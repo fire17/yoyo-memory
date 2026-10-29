@@ -68,3 +68,7 @@ button.link{background:none;border:0;color:var(--accent-d);font:inherit;text-dec
 figcaption{margin-top:8px}
 .members{padding-inline-start:20px}
 @media (min-width:700px){.actions{grid-template-columns:1fr 1fr auto}.yitems{grid-template-columns:1fr 1fr}.story{grid-column:1/-1}}
+.offline-banner{position:fixed;inset-inline:0;bottom:0;z-index:50;background:#5a4a40;color:#fff;text-align:center;font-size:.85rem;font-weight:600;padding:8px 16px calc(8px + env(safe-area-inset-bottom))}
+.offline-banner[hidden]{display:none}
+body.is-offline footer{padding-bottom:64px}
+.msg.offline-note{background:#f4ece1;color:var(--soft)}
